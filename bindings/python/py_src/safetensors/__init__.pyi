@@ -81,12 +81,8 @@ class safe_open:
 
         device (`str`, defaults to `"cpu"`):
             The device on which you want the tensors.
-
-        use_gds (`bool`, defaults to `False`):
-            When True, uses NVIDIA GPUDirect Storage (via kvikio) to read
-            tensor data directly from disk into GPU memory, bypassing CPU.
     """
-    def __init__(self, filename, framework, device=..., use_gds=False):
+    def __init__(self, filename, framework, device=...):
         pass
 
     def __enter__(self):
