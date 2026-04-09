@@ -26,6 +26,7 @@ static TENSORFLOW_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static FLAX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static MLX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
+static KVIKIO_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 
 struct TensorDataPointer {
     addr: u64,
@@ -440,6 +441,10 @@ enum Storage {
     // Paddle can handle the whole lifecycle.
     // https://www.paddlepaddle.org.cn/documentation/docs/en/develop/api/paddle/MmapStorage_en.html
     Paddle(OnceLock<PyObject>),
+    /// GPUDirect Storage via kvikio.
+    /// Stores (file_path, data_offset) so tensor data can be read
+    /// directly from disk into GPU memory on demand.
+    Gds(PathBuf, usize),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd)]
@@ -493,7 +498,12 @@ struct Open {
 }
 
 impl Open {
-    fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
+    fn new(
+        filename: PathBuf,
+        framework: Framework,
+        device: Option<Device>,
+        use_gds: bool,
+    ) -> PyResult<Self> {
         let file = File::open(&filename).map_err(|_| {
             PyFileNotFoundError::new_err(format!(
                 "No such file or directory: {}",
@@ -505,11 +515,81 @@ impl Open {
             && framework != Framework::Pytorch
             && framework != Framework::Paddle
         {
-            return Err(SafetensorError::new_err(format!(
-                "Device {device} is not supported for framework {framework}",
-            )));
+            if !use_gds {
+                return Err(SafetensorError::new_err(format!(
+                    "Device {device} is not supported for framework {framework}",
+                )));
+            }
         }
 
+        if use_gds {
+            // GDS path: read only the header into CPU memory, defer tensor
+            // data reads to kvikio which loads directly into GPU memory.
+            let file_size = file
+                .metadata()
+                .map_err(|e| SafetensorError::new_err(format!("Failed to get file size: {e}")))?
+                .len() as usize;
+
+            // Read the 8-byte header length prefix
+            use std::io::Read as _;
+            let mut reader = std::io::BufReader::new(&file);
+            let mut header_len_bytes = [0u8; 8];
+            reader.read_exact(&mut header_len_bytes).map_err(|e| {
+                SafetensorError::new_err(format!("Failed to read header length: {e}"))
+            })?;
+            let header_len =
+                u64::from_le_bytes(header_len_bytes) as usize;
+            let total_header = 8 + header_len;
+
+            // Read just the header bytes
+            let mut header_buffer = vec![0u8; total_header];
+            header_buffer[..8].copy_from_slice(&header_len_bytes);
+            reader
+                .read_exact(&mut header_buffer[8..])
+                .map_err(|e| {
+                    SafetensorError::new_err(format!("Failed to read header: {e}"))
+                })?;
+
+            let (n, metadata) =
+                SafeTensors::read_metadata_from_header(&header_buffer, file_size)
+                    .map_err(|e| {
+                        SafetensorError::new_err(format!(
+                            "Error while deserializing header: {e}"
+                        ))
+                    })?;
+
+            let offset = n + 8;
+
+            // Import the framework module
+            Python::with_gil(|py| -> PyResult<()> {
+                match framework {
+                    Framework::Pytorch => {
+                        let module = PyModule::import(py, intern!(py, "torch"))?;
+                        TORCH_MODULE.get_or_init_py_attached(py, || module.into());
+                    }
+                    _ => {
+                        let module = PyModule::import(py, intern!(py, "numpy"))?;
+                        NUMPY_MODULE.get_or_init_py_attached(py, || module.into());
+                    }
+                };
+                // Import kvikio
+                let kvikio = PyModule::import(py, intern!(py, "kvikio"))?;
+                KVIKIO_MODULE.get_or_init_py_attached(py, || kvikio.into());
+                Ok(())
+            })?;
+
+            let storage = Arc::new(Storage::Gds(filename, offset));
+
+            return Ok(Self {
+                metadata,
+                offset,
+                framework,
+                device,
+                storage,
+            });
+        }
+
+        // Standard (non-GDS) path: mmap the entire file
         // SAFETY: Mmap is used to prevent allocating in Rust
         // before making a copy within Python.
         let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
@@ -882,6 +962,136 @@ impl Open {
                     Ok(tensor.into_pyobject(py)?.into())
                 })
             }
+            Storage::Gds(filepath, data_offset) => {
+                Python::with_gil(|py| -> PyResult<PyObject> {
+                    let nbytes = info.data_offsets.1 - info.data_offsets.0;
+                    let file_offset = info.data_offsets.0 + data_offset;
+
+                    let kvikio = get_module(py, &KVIKIO_MODULE)?;
+                    let cufile_cls = kvikio.getattr(intern!(py, "CuFile"))?;
+                    let py_path: PyObject = filepath
+                        .to_str()
+                        .ok_or_else(|| {
+                            SafetensorError::new_err(format!(
+                                "Path {} is not valid UTF-8",
+                                filepath.display()
+                            ))
+                        })?
+                        .into_pyobject(py)?
+                        .into();
+
+                    match &self.framework {
+                        Framework::Pytorch => {
+                            let torch = get_module(py, &TORCH_MODULE)?;
+                            let dtype: PyObject = get_pydtype(torch, info.dtype, false)?;
+                            let torch_uint8: PyObject = get_pydtype(torch, Dtype::U8, false)?;
+                            let device: PyObject =
+                                self.device.clone().into_pyobject(py)?.into();
+
+                            // Allocate GPU buffer: torch.empty(nbytes, dtype=torch.uint8, device=device)
+                            let alloc_kwargs = [
+                                (intern!(py, "dtype"), torch_uint8),
+                                (intern!(py, "device"), device),
+                            ]
+                            .into_py_dict(py)?;
+                            let gpu_buf = torch
+                                .call_method("empty", (nbytes,), Some(&alloc_kwargs))?;
+
+                            // Read directly into GPU buffer via kvikio.
+                            // Close the CuFile before propagating read errors
+                            // to avoid leaking file descriptors.
+                            let cufile = cufile_cls.call1((&py_path, "r"))?;
+                            let read_kwargs = [
+                                (
+                                    intern!(py, "size"),
+                                    nbytes.into_pyobject(py)?.into_any(),
+                                ),
+                                (
+                                    intern!(py, "file_offset"),
+                                    file_offset.into_pyobject(py)?.into_any(),
+                                ),
+                            ]
+                            .into_py_dict(py)?;
+                            let read_result = cufile.call_method(
+                                "read",
+                                (&gpu_buf,),
+                                Some(&read_kwargs),
+                            );
+                            cufile.call_method0("close")?;
+                            read_result?;
+
+                            // View as target dtype and reshape
+                            let view_kwargs =
+                                [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
+                            let mut shape = info.shape.to_vec();
+                            if info.dtype == Dtype::F4 {
+                                let n = shape.len();
+                                if shape[n - 1] % 2 != 0 {
+                                    return Err(SafetensorError::new_err(format!(
+                                        "f4_x2 dtype requires that the last dim be divisible by 2 in torch: got {shape:?}",
+                                    )));
+                                }
+                                shape[n - 1] /= 2;
+                            }
+                            let shape: PyObject = shape.into_pyobject(py)?.into();
+                            let tensor = gpu_buf
+                                .getattr(intern!(py, "view"))?
+                                .call((), Some(&view_kwargs))?
+                                .getattr(intern!(py, "reshape"))?
+                                .call1((shape,))?;
+                            Ok(tensor.into_pyobject(py)?.into())
+                        }
+                        _ => {
+                            // For non-PyTorch frameworks with GDS, read into a CuPy
+                            // buffer and then convert via numpy on CPU.
+                            let cupy = PyModule::import(py, intern!(py, "cupy"))?;
+                            let cupy_uint8 = cupy.getattr(intern!(py, "uint8"))?;
+                            let alloc_kwargs =
+                                [(intern!(py, "dtype"), cupy_uint8.as_any())]
+                                    .into_py_dict(py)?;
+                            let gpu_buf =
+                                cupy.call_method("empty", (nbytes,), Some(&alloc_kwargs))?;
+
+                            let cufile = cufile_cls.call1((&py_path, "r"))?;
+                            let read_kwargs = [
+                                (
+                                    intern!(py, "size"),
+                                    nbytes.into_pyobject(py)?.into_any(),
+                                ),
+                                (
+                                    intern!(py, "file_offset"),
+                                    file_offset.into_pyobject(py)?.into_any(),
+                                ),
+                            ]
+                            .into_py_dict(py)?;
+                            let read_result = cufile.call_method(
+                                "read",
+                                (&gpu_buf,),
+                                Some(&read_kwargs),
+                            );
+                            cufile.call_method0("close")?;
+                            read_result?;
+
+                            // Transfer to CPU as bytes, then create framework tensor.
+                            // cupy.ndarray.get() returns a numpy array; call .tobytes()
+                            // to obtain a bytes object that PyByteArray can wrap.
+                            let cpu_buf = gpu_buf.call_method0("get")?;
+                            let cpu_bytes = cpu_buf.call_method0("tobytes")?;
+                            let array: PyObject =
+                                PyByteArray::new(py, cpu_bytes.extract::<&[u8]>()?)
+                                    .into_any()
+                                    .into();
+                            create_tensor(
+                                &self.framework,
+                                info.dtype,
+                                &info.shape,
+                                array,
+                                &self.device,
+                            )
+                        }
+                    }
+                })
+            }
         }
     }
 
@@ -950,9 +1160,14 @@ impl safe_open {
 #[pymethods]
 impl safe_open {
     #[new]
-    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu)))]
-    fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
-        let inner = Some(Open::new(filename, framework, device)?);
+    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu), use_gds=false))]
+    fn new(
+        filename: PathBuf,
+        framework: Framework,
+        device: Option<Device>,
+        use_gds: bool,
+    ) -> PyResult<Self> {
+        let inner = Some(Open::new(filename, framework, device, use_gds)?);
         Ok(Self { inner })
     }
 
@@ -1341,6 +1556,82 @@ impl PySafeSlice {
                 tensor.setattr(intern!(py, "_safetensors_storage"), storage)?;
                 Ok(tensor.into())
             }),
+            Storage::Gds(filepath, data_offset) => {
+                Python::with_gil(|py| -> PyResult<PyObject> {
+                    // GDS slice: read the full tensor into GPU, then apply the slice
+                    // on the framework side. This avoids complex byte-range
+                    // calculations for non-contiguous slices.
+                    let nbytes = self.info.data_offsets.1 - self.info.data_offsets.0;
+                    let file_offset = self.info.data_offsets.0 + data_offset;
+                    let slices = slices.into_pyobject(py)?;
+
+                    let kvikio = get_module(py, &KVIKIO_MODULE)?;
+                    let cufile_cls = kvikio.getattr(intern!(py, "CuFile"))?;
+                    let py_path: PyObject = filepath
+                        .to_str()
+                        .ok_or_else(|| {
+                            SafetensorError::new_err(format!(
+                                "Path {} is not valid UTF-8",
+                                filepath.display()
+                            ))
+                        })?
+                        .into_pyobject(py)?
+                        .into();
+
+                    match &self.framework {
+                        Framework::Pytorch => {
+                            let torch = get_module(py, &TORCH_MODULE)?;
+                            let dtype: PyObject =
+                                get_pydtype(torch, self.info.dtype, false)?;
+                            let torch_uint8: PyObject =
+                                get_pydtype(torch, Dtype::U8, false)?;
+                            let device: PyObject =
+                                self.device.clone().into_pyobject(py)?.into();
+
+                            let alloc_kwargs = [
+                                (intern!(py, "dtype"), torch_uint8),
+                                (intern!(py, "device"), device),
+                            ]
+                            .into_py_dict(py)?;
+                            let gpu_buf = torch
+                                .call_method("empty", (nbytes,), Some(&alloc_kwargs))?;
+
+                            let cufile = cufile_cls.call1((&py_path, "r"))?;
+                            let read_kwargs = [
+                                (
+                                    intern!(py, "size"),
+                                    nbytes.into_pyobject(py)?.into_any(),
+                                ),
+                                (
+                                    intern!(py, "file_offset"),
+                                    file_offset.into_pyobject(py)?.into_any(),
+                                ),
+                            ]
+                            .into_py_dict(py)?;
+                            let read_result =
+                                cufile.call_method("read", (&gpu_buf,), Some(&read_kwargs));
+                            cufile.call_method0("close")?;
+                            read_result?;
+
+                            let view_kwargs =
+                                [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
+                            let shape = self.info.shape.to_vec();
+                            let shape: PyObject = shape.into_pyobject(py)?.into();
+                            let tensor = gpu_buf
+                                .getattr(intern!(py, "view"))?
+                                .call((), Some(&view_kwargs))?
+                                .getattr(intern!(py, "reshape"))?
+                                .call1((shape,))?
+                                .getattr(intern!(py, "__getitem__"))?
+                                .call1((slices,))?;
+                            Ok(tensor.into())
+                        }
+                        _ => Err(SafetensorError::new_err(
+                            "GDS slicing is only supported for PyTorch framework",
+                        )),
+                    }
+                })
+            }
         }
     }
 }
@@ -1562,15 +1853,20 @@ impl _safe_open_handle {
 #[pymethods]
 impl _safe_open_handle {
     #[new]
-    #[pyo3(signature = (f, framework, device=Some(Device::Cpu)))]
-    fn new(f: PyObject, framework: Framework, device: Option<Device>) -> PyResult<Self> {
+    #[pyo3(signature = (f, framework, device=Some(Device::Cpu), use_gds=false))]
+    fn new(
+        f: PyObject,
+        framework: Framework,
+        device: Option<Device>,
+        use_gds: bool,
+    ) -> PyResult<Self> {
         let filename = Python::with_gil(|py| -> PyResult<PathBuf> {
             let _ = f.getattr(py, "fileno")?;
             let filename = f.getattr(py, "name")?;
             let filename: PathBuf = filename.extract(py)?;
             Ok(filename)
         })?;
-        let inner = Some(Open::new(filename, framework, device)?);
+        let inner = Some(Open::new(filename, framework, device, use_gds)?);
         Ok(Self { inner })
     }
 
