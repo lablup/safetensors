@@ -424,55 +424,6 @@ impl<'data> SafeTensors<'data> {
         Ok((n, metadata))
     }
 
-    /// Given a byte-buffer containing only the safetensor header (the 8-byte
-    /// length prefix plus the JSON metadata) and the total file size, parses
-    /// and validates the metadata.
-    ///
-    /// Unlike [`read_metadata`](Self::read_metadata), the buffer does **not**
-    /// need to contain the tensor data — only the header portion is required.
-    /// The tensor data offsets are validated against `file_size` instead.
-    ///
-    /// This is useful when the tensor data will be loaded separately (e.g. via
-    /// GPUDirect Storage directly into GPU memory) and only the header needs
-    /// to be read into CPU memory.
-    pub fn read_metadata_from_header(
-        header_buffer: &[u8],
-        file_size: usize,
-    ) -> Result<(usize, Metadata), SafeTensorError> {
-        let Some(header_size_bytes) = header_buffer.get(..N_LEN) else {
-            return Err(SafeTensorError::HeaderTooSmall);
-        };
-        let arr: [u8; N_LEN] = header_size_bytes
-            .try_into()
-            .expect("this can't fail due to how `header_size_bytes` is defined above");
-        let n: usize = u64::from_le_bytes(arr)
-            .try_into()
-            .map_err(|_| SafeTensorError::HeaderTooLarge)?;
-
-        if n > MAX_HEADER_SIZE {
-            return Err(SafeTensorError::HeaderTooLarge);
-        }
-
-        let stop = n
-            .checked_add(N_LEN)
-            .ok_or(SafeTensorError::InvalidHeaderLength)?;
-
-        let Some(header_bytes) = header_buffer.get(N_LEN..stop) else {
-            return Err(SafeTensorError::InvalidHeaderLength);
-        };
-        let string =
-            core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
-        let metadata: HashMetadata =
-            serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
-        let metadata: Metadata = metadata.try_into()?;
-        let buffer_end = metadata.validate()?;
-        if buffer_end + N_LEN + n != file_size {
-            return Err(SafeTensorError::MetadataIncompleteBuffer);
-        }
-
-        Ok((n, metadata))
-    }
-
     /// Given a byte-buffer representing the whole safetensor file
     /// parses it and returns the Deserialized form (No Tensor allocation).
     ///
@@ -1598,65 +1549,5 @@ mod tests {
             }
             _ => panic!("This should not be able to be serialized"),
         }
-    }
-
-    #[test]
-    fn test_read_metadata_from_header() {
-        // Full valid safetensors file
-        let serialized = b"<\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-        let file_size = serialized.len();
-
-        // Extract just the header portion (8 + 0x3c = 8 + 60 = 68 bytes)
-        let header_len = u64::from_le_bytes(serialized[..8].try_into().unwrap()) as usize;
-        let header_buffer = &serialized[..8 + header_len];
-
-        let (n, metadata) =
-            SafeTensors::read_metadata_from_header(header_buffer, file_size).unwrap();
-        assert_eq!(n, header_len);
-        assert!(metadata.info("test").is_some());
-        let info = metadata.info("test").unwrap();
-        assert_eq!(info.dtype, Dtype::I32);
-        assert_eq!(info.shape, vec![2, 2]);
-        assert_eq!(info.data_offsets, (0, 16));
-    }
-
-    #[test]
-    fn test_read_metadata_from_header_wrong_file_size() {
-        let serialized = b"<\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-        let header_len = u64::from_le_bytes(serialized[..8].try_into().unwrap()) as usize;
-        let header_buffer = &serialized[..8 + header_len];
-
-        // Wrong file size should fail
-        match SafeTensors::read_metadata_from_header(header_buffer, 999) {
-            Err(SafeTensorError::MetadataIncompleteBuffer) => {}
-            other => panic!("Expected MetadataIncompleteBuffer, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_read_metadata_from_header_consistency() {
-        // Verify that read_metadata_from_header gives the same result as read_metadata
-        let serialized = b"<\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-        let file_size = serialized.len();
-        let header_len = u64::from_le_bytes(serialized[..8].try_into().unwrap()) as usize;
-        let header_buffer = &serialized[..8 + header_len];
-
-        let (n1, metadata1) = SafeTensors::read_metadata(serialized).unwrap();
-        let (n2, metadata2) =
-            SafeTensors::read_metadata_from_header(header_buffer, file_size).unwrap();
-
-        assert_eq!(n1, n2);
-        assert_eq!(
-            metadata1.info("test").unwrap().dtype,
-            metadata2.info("test").unwrap().dtype
-        );
-        assert_eq!(
-            metadata1.info("test").unwrap().shape,
-            metadata2.info("test").unwrap().shape
-        );
-        assert_eq!(
-            metadata1.info("test").unwrap().data_offsets,
-            metadata2.info("test").unwrap().data_offsets
-        );
     }
 }
