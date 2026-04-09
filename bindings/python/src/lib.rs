@@ -997,7 +997,9 @@ impl Open {
                             let gpu_buf = torch
                                 .call_method("empty", (nbytes,), Some(&alloc_kwargs))?;
 
-                            // Read directly into GPU buffer via kvikio
+                            // Read directly into GPU buffer via kvikio.
+                            // Close the CuFile before propagating read errors
+                            // to avoid leaking file descriptors.
                             let cufile = cufile_cls.call1((&py_path, "r"))?;
                             let read_kwargs = [
                                 (
@@ -1010,12 +1012,13 @@ impl Open {
                                 ),
                             ]
                             .into_py_dict(py)?;
-                            cufile.call_method(
+                            let read_result = cufile.call_method(
                                 "read",
                                 (&gpu_buf,),
                                 Some(&read_kwargs),
-                            )?;
+                            );
                             cufile.call_method0("close")?;
+                            read_result?;
 
                             // View as target dtype and reshape
                             let view_kwargs =
@@ -1061,17 +1064,21 @@ impl Open {
                                 ),
                             ]
                             .into_py_dict(py)?;
-                            cufile.call_method(
+                            let read_result = cufile.call_method(
                                 "read",
                                 (&gpu_buf,),
                                 Some(&read_kwargs),
-                            )?;
+                            );
                             cufile.call_method0("close")?;
+                            read_result?;
 
-                            // Transfer to CPU as numpy array, then create framework tensor
+                            // Transfer to CPU as bytes, then create framework tensor.
+                            // cupy.ndarray.get() returns a numpy array; call .tobytes()
+                            // to obtain a bytes object that PyByteArray can wrap.
                             let cpu_buf = gpu_buf.call_method0("get")?;
+                            let cpu_bytes = cpu_buf.call_method0("tobytes")?;
                             let array: PyObject =
-                                PyByteArray::new(py, cpu_buf.extract::<&[u8]>()?)
+                                PyByteArray::new(py, cpu_bytes.extract::<&[u8]>()?)
                                     .into_any()
                                     .into();
                             create_tensor(
@@ -1601,8 +1608,10 @@ impl PySafeSlice {
                                 ),
                             ]
                             .into_py_dict(py)?;
-                            cufile.call_method("read", (&gpu_buf,), Some(&read_kwargs))?;
+                            let read_result =
+                                cufile.call_method("read", (&gpu_buf,), Some(&read_kwargs));
                             cufile.call_method0("close")?;
+                            read_result?;
 
                             let view_kwargs =
                                 [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
