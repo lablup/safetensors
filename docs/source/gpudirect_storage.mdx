@@ -1,0 +1,171 @@
+# GPUDirect Storage
+
+## TL;DR
+
+Load safetensors files directly from NVMe storage into GPU memory, bypassing CPU entirely.
+
+```python
+from safetensors.torch import load_file
+
+# Standard loading: disk → CPU → GPU
+tensors = load_file("model.safetensors", device="cuda:0")
+
+# GDS loading: disk → GPU (no CPU copy)
+tensors = load_file("model.safetensors", device="cuda:0", use_gds=True)
+```
+
+## What is GPUDirect Storage?
+
+[GPUDirect Storage (GDS)](https://developer.nvidia.com/gpudirect-storage) is an NVIDIA technology
+that enables a direct data path between NVMe storage and GPU memory. In a standard loading
+pipeline, tensor data travels **disk → CPU RAM → GPU RAM**, requiring two copies and consuming
+CPU memory proportional to the model size. With GDS, the data travels **disk → GPU RAM** via
+DMA, cutting the transfer in half and freeing the CPU for other work.
+
+Safetensors is particularly well-suited for GDS because of its format: a small JSON header
+followed by contiguous, non-overlapping tensor data at known byte offsets. This means we can
+read the header on the CPU (a few kilobytes), then issue precise GDS reads for each tensor's
+byte range directly into a GPU buffer — no need to mmap or load the entire file.
+
+## Requirements
+
+- **NVIDIA GPU** with CUDA support
+- **[kvikio](https://github.com/rapidsai/kvikio)** Python package (wraps NVIDIA cuFile)
+- **GDS driver** (optional — kvikio automatically falls back to POSIX I/O if not installed)
+
+Install kvikio:
+
+```bash
+# conda (recommended)
+conda install -c rapidsai -c conda-forge kvikio
+
+# pip
+pip install kvikio-cu12  # adjust for your CUDA version
+```
+
+## Usage
+
+### Loading with `load_file`
+
+The simplest way to use GDS is through `load_file` with the `use_gds=True` parameter:
+
+```python
+from safetensors.torch import load_file
+
+tensors = load_file("model.safetensors", device="cuda:0", use_gds=True)
+```
+
+### Loading with `safe_open`
+
+For more control (lazy loading, slicing, multi-GPU), use `safe_open` directly:
+
+```python
+from safetensors import safe_open
+
+with safe_open("model.safetensors", framework="pt", device="cuda:0", use_gds=True) as f:
+    # Only the header is read at this point — no tensor data loaded yet
+    print(f.keys())
+
+    # Each get_tensor() reads directly from disk into GPU memory
+    embedding = f.get_tensor("embedding")
+    attention = f.get_tensor("attention")
+```
+
+### Partial loading (slicing)
+
+GDS also supports sliced tensor access. The full tensor is read into GPU memory, then sliced
+on-device:
+
+```python
+from safetensors import safe_open
+
+with safe_open("model.safetensors", framework="pt", device="cuda:0", use_gds=True) as f:
+    tensor_slice = f.get_slice("embedding")
+    vocab_size, hidden_dim = tensor_slice.get_shape()
+    # Read the full tensor via GDS, then slice on GPU
+    partial = tensor_slice[:, :hidden_dim // 2]
+```
+
+### Multi-GPU loading
+
+GDS is particularly useful in distributed settings. Each GPU can load only the tensors it
+needs, directly from disk:
+
+```python
+from safetensors import safe_open
+
+def load_shard(filename, tensor_names, device):
+    result = {}
+    with safe_open(filename, framework="pt", device=device, use_gds=True) as f:
+        for name in tensor_names:
+            result[name] = f.get_tensor(name)
+    return result
+
+# Each GPU loads its own shard directly from storage
+shard_0 = load_shard("model.safetensors", ["layer.0.weight", "layer.0.bias"], "cuda:0")
+shard_1 = load_shard("model.safetensors", ["layer.1.weight", "layer.1.bias"], "cuda:1")
+```
+
+## How it works
+
+When `use_gds=True` is set, the loading pipeline changes:
+
+| Step | Standard path | GDS path |
+| --- | --- | --- |
+| 1. Open file | mmap entire file | Read first 8 bytes (header size) |
+| 2. Parse header | Read from mmap buffer | Read header bytes via normal I/O |
+| 3. Load tensor | Slice mmap → `torch.frombuffer` → `.to(device)` | `torch.empty(device="cuda")` → `kvikio.CuFile.read()` → `.view(dtype)` |
+| 4. Memory used | File size in CPU virtual memory | Header only (a few KB) |
+
+The key difference is that with GDS, the file is **never mapped into CPU address space**.
+Only the small JSON header (typically a few kilobytes) is read on the CPU. Each tensor's
+data is read by kvikio from the file at its exact byte offset directly into a pre-allocated
+GPU buffer.
+
+## kvikio configuration
+
+kvikio provides several tuning knobs via environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `KVIKIO_COMPAT_MODE` | `AUTO` | `OFF` = force GDS, `ON` = force POSIX, `AUTO` = use GDS when available |
+| `KVIKIO_NTHREADS` | `1` | Number of I/O threads for parallel reads |
+| `KVIKIO_TASK_SIZE` | `4194304` | Chunk size (bytes) for parallel I/O splitting |
+| `KVIKIO_GDS_THRESHOLD` | `16384` | Minimum transfer size to use GDS (below this, POSIX is used) |
+
+For large models, increasing the thread count can improve throughput:
+
+```bash
+export KVIKIO_NTHREADS=16
+export KVIKIO_COMPAT_MODE=OFF  # force GDS (will error if driver is not available)
+```
+
+Or configure from Python:
+
+```python
+import kvikio.defaults
+
+kvikio.defaults.num_threads_reset(16)
+kvikio.defaults.compat_mode_reset(kvikio.CompatMode.OFF)
+```
+
+## When to use GDS
+
+GDS is most beneficial when:
+
+- **Loading large models** (multi-GB) where CPU memory pressure is a concern
+- **Multi-GPU setups** where each device loads different tensors from the same file
+- **NVMe storage** with high sequential read bandwidth
+- **Iterative development** where you repeatedly load model weights
+
+GDS may not help when:
+
+- Loading small models (overhead of kvikio file open/close dominates)
+- The file is already in the OS page cache (mmap is effectively zero-copy from cache)
+- Using HDD or network storage (GDS requires NVMe or supported storage)
+
+## Compatibility
+
+When kvikio cannot use GDS (e.g., the NVIDIA GDS driver is not installed), it automatically
+falls back to POSIX I/O with bounce buffers. This means `use_gds=True` is safe to use in
+any environment — it will use the best available I/O path without errors.

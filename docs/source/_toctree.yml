@@ -9,6 +9,8 @@
     title: Metadata Parsing
   - local: convert-weights
     title: Convert weights to safetensors
+  - local: gpudirect_storage
+    title: GPUDirect Storage
   title: Getting started
 - sections: 
   - local: api/torch
