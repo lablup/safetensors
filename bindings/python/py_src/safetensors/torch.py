@@ -320,7 +320,9 @@ def save_file(
 
 
 def load_file(
-    filename: Union[str, os.PathLike], device: Union[str, int] = "cpu"
+    filename: Union[str, os.PathLike],
+    device: Union[str, int] = "cpu",
+    use_gds: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
     Loads a safetensors file into torch format.
@@ -331,6 +333,10 @@ def load_file(
         device (`Union[str, int]`, *optional*, defaults to `cpu`):
             The device where the tensors need to be located after load.
             available options are all regular torch device locations.
+        use_gds (`bool`, *optional*, defaults to `False`):
+            When True, uses NVIDIA GPUDirect Storage (via kvikio) to read
+            tensor data directly from disk into GPU memory, bypassing CPU.
+            Requires the ``kvikio`` package and a CUDA device.
 
     Returns:
         `Dict[str, torch.Tensor]`: dictionary that contains name as key, value as `torch.Tensor`
@@ -342,10 +348,13 @@ def load_file(
 
     file_path = "./my_folder/bert.safetensors"
     loaded = load_file(file_path)
+
+    # With GPUDirect Storage for direct disk-to-GPU loading
+    loaded_gds = load_file(file_path, device="cuda:0", use_gds=True)
     ```
     """
     result = {}
-    with safe_open(filename, framework="pt", device=device) as f:
+    with safe_open(filename, framework="pt", device=device, use_gds=use_gds) as f:
         for k in f.offset_keys():
             result[k] = f.get_tensor(k)
     return result
